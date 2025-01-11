@@ -1,0 +1,16 @@
+[package]
+name = "stash"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.95"
+bpaf = { version = "0.9.15", features = ["derive"] }
+dirs = "5.0.1"
+dom_smoothie = "0.3.0"
+fs-err = "3.0.0"
+scraper = "0.22.0"
+serde = { version = "1.0.217", features = ["derive"] }
+toml = "0.8.19"
+ureq = { version = "2.12.1", features = ["cookies", "json"] }
+url = "2.5.4"
