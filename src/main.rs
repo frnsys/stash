@@ -1,7 +1,13 @@
-use std::{collections::HashMap, io::Read, path::Path};
+use std::{
+    collections::HashMap,
+    io::Read,
+    path::{Path, PathBuf},
+};
 
 use bpaf::Bpaf;
-use dom_smoothie::{Article, Config, Readability};
+use color_eyre::eyre::{Result, bail, eyre};
+use dom_smoothie::{Article as ExtractArticle, Config as ExtractConfig, Readability};
+use epub_builder::{EpubBuilder, EpubContent, ZipLibrary};
 use scraper::{Html, Selector};
 use serde::{Deserialize, Serialize};
 use url::Url;
@@ -11,6 +17,11 @@ const USER_AGENTS: &[&str] = &[
     "curl/8.11",
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
 ];
+
+#[derive(Deserialize, Debug)]
+struct Config {
+    output_dir: String,
+}
 
 #[derive(Serialize, Deserialize, Default, Debug)]
 #[serde(untagged)]
@@ -25,7 +36,7 @@ enum ExtractionMethod {
     },
 }
 impl ExtractionMethod {
-    fn extract(&self, uri: &str, html: &str) -> anyhow::Result<WallabagEntry> {
+    fn extract(&self, uri: &str, html: &str) -> Result<Article> {
         match self {
             Self::Auto => auto_extract(uri, html),
             Self::Manual {
@@ -38,11 +49,11 @@ impl ExtractionMethod {
     }
 }
 
-fn auto_extract(url: &str, html: &str) -> anyhow::Result<WallabagEntry> {
-    let cfg = Config::default();
+fn auto_extract(url: &str, html: &str) -> Result<Article> {
+    let cfg = ExtractConfig::default();
     let mut readability = Readability::new(html, Some(url), Some(cfg))?;
-    let article: Article = readability.parse()?;
-    Ok(WallabagEntry {
+    let article: ExtractArticle = readability.parse()?;
+    Ok(Article {
         url: url.to_string(),
         title: article.title,
         authors: article.byline.unwrap_or_default(),
@@ -51,8 +62,8 @@ fn auto_extract(url: &str, html: &str) -> anyhow::Result<WallabagEntry> {
     })
 }
 
-fn selector(sel: &str) -> anyhow::Result<Selector> {
-    Selector::parse(sel).map_err(|err| anyhow::anyhow!(err.to_string()))
+fn selector(sel: &str) -> Result<Selector> {
+    Selector::parse(sel).map_err(|err| eyre!(err.to_string()))
 }
 
 fn manual_extract(
@@ -62,14 +73,14 @@ fn manual_extract(
     body_sel: &str,
     authors_sel: &str,
     date_sel: &str,
-) -> anyhow::Result<WallabagEntry> {
+) -> Result<Article> {
     let doc = Html::parse_document(html);
     let title_sel = selector(title_sel)?;
     let body_sel = selector(body_sel)?;
     let authors_sel = selector(authors_sel)?;
     let date_sel = selector(date_sel)?;
 
-    let mut entry = WallabagEntry {
+    let mut entry = Article {
         url: url.to_string(),
         ..Default::default()
     };
@@ -95,71 +106,59 @@ fn manual_extract(
     if let Some(el) = doc.select(&body_sel).next() {
         entry.content = el.inner_html();
     } else {
-        anyhow::bail!("Could not find main content element.");
+        bail!("Could not find main content element.");
     }
     if entry.content.is_empty() {
-        anyhow::bail!("Main content element is empty.");
+        bail!("Main content element is empty.");
     }
 
     Ok(entry)
 }
 
 #[derive(Serialize, Default)]
-struct WallabagEntry {
+struct Article {
     url: String,
     title: String,
     content: String,
     authors: String,
     published_at: String,
 }
+impl Article {
+    fn build_epub(&self, output_dir: &Path) -> epub_builder::Result<PathBuf> {
+        let fname = slug::slugify(&self.title);
+        let fname = format!("{fname}.epub");
+        let path = output_dir.join(fname);
+        let output = fs_err::OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open(&path)
+            .unwrap();
 
-struct WallabagClient {
-    access_token: String,
-}
-impl WallabagClient {
-    fn new(access_token: String) -> Self {
-        Self { access_token }
-    }
+        let content = EpubContent::new("main.xhtml", self.content.as_bytes())
+            .title(&self.title)
+            .reftype(epub_builder::ReferenceType::Text);
+        let mut builder = EpubBuilder::new(ZipLibrary::new()?)?;
 
-    // <https://app.wallabag.it/api/doc/>
-    fn send_entry(&self, entry: &WallabagEntry) -> Result<ureq::Response, ureq::Error> {
-        let token = format!("Bearer {}", self.access_token);
-        ureq::post("https://app.wallabag.it/api/entries")
-            .set("Authorization", &token)
-            .send_json(entry)
-    }
-}
+        builder
+            .metadata("author", &self.authors)?
+            .metadata("title", &self.title)?
+            .metadata("description", &self.url)?
+            .add_content(content)?;
 
-#[derive(Deserialize)]
-struct AuthResponse {
-    access_token: String,
-}
+        match dateparser::parse(&self.published_at) {
+            Ok(parsed) => {
+                builder.set_publication_date(parsed);
+            }
+            Err(err) => {
+                eprintln!(
+                    "Failed to parse published datetime {}: {}",
+                    self.published_at, err
+                );
+            }
+        }
 
-#[derive(Deserialize)]
-struct Credentials {
-    client_id: String,
-    client_secret: String,
-    username: String,
-    password: String,
-}
-impl Credentials {
-    fn authenticate(&self) -> anyhow::Result<String> {
-        let resp = ureq::post("https://app.wallabag.it/oauth/v2/token")
-            .send_json(ureq::json!({
-                "grant_type": "password",
-                "client_id": &self.client_id,
-                "client_secret": &self.client_secret,
-                "username": &self.username,
-                "password": &self.password,
-            }))
-            .inspect_err(|err| match err {
-                ureq::Error::Status(code, resp) => {
-                    eprintln!("[{code}]: {:?}", resp.status_text())
-                }
-                _ => (),
-            })?
-            .into_json::<AuthResponse>()?;
-        Ok(resp.access_token)
+        builder.generate(output)?;
+        Ok(path)
     }
 }
 
@@ -169,11 +168,11 @@ struct Extractor {
     configs: HashMap<String, ExtractionMethod>,
 }
 impl Extractor {
-    fn load(path: &Path) -> anyhow::Result<Self> {
+    fn load(path: &Path) -> Result<Self> {
         Ok(toml::from_str(&fs_err::read_to_string(path)?)?)
     }
 
-    fn fetch_article(&self, url: &str) -> anyhow::Result<WallabagEntry> {
+    fn fetch_article(&self, url: &str) -> Result<Article> {
         let url_parsed = Url::parse(url)?;
         let default = ExtractionMethod::default();
         let method = match url_parsed.domain() {
@@ -212,15 +211,15 @@ impl Extractor {
             return method.extract(url, &html);
         }
 
-        Err(anyhow::anyhow!("All user-agents failed."))
+        Err(eyre!("All user-agents failed."))
     }
 }
 
 #[derive(Clone, Debug, Bpaf)]
 #[bpaf(options, version)]
-/// An extractor for Wallabag.
+/// An web article extractor.
 /// Uses automatic or manually-defined-rule extraction,
-/// then sends the extracted content to Wallabag.
+/// then generates an epub from the extracted content.
 struct Args {
     /// Url to extract.
     #[bpaf(positional("URL"))]
@@ -237,20 +236,17 @@ fn ask_confirm(question: &str) -> bool {
     }
 }
 
-fn main() -> anyhow::Result<()> {
+fn main() -> Result<()> {
     let opts = args().run();
 
     let config_dir = dirs::config_dir()
         .expect("Config dir exists")
         .join(APP_NAME);
-    let creds_path = config_dir.join("credentials.toml");
-    let creds: Credentials = toml::from_str(&fs_err::read_to_string(creds_path)?)?;
+    let config_path = config_dir.join("config.toml");
+    let config: Config = toml::from_str(&fs_err::read_to_string(config_path)?)?;
 
-    let extractor_path = config_dir.join("extractor.toml");
+    let extractor_path = config_dir.join("sites.toml");
     let extractor = Extractor::load(&extractor_path)?;
-
-    let token = creds.authenticate()?;
-    let client = WallabagClient::new(token);
     let entry = extractor.fetch_article(&opts.url)?;
 
     // Preview results.
@@ -258,8 +254,10 @@ fn main() -> anyhow::Result<()> {
     println!("Authors: {}", entry.authors);
     println!("Published: {}", entry.published_at);
     println!("Content: {}", entry.content);
-    if ask_confirm("Send to Wallabag?") {
-        client.send_entry(&entry)?;
+    if ask_confirm("Ok?") {
+        let output_dir = expanduser::expanduser(config.output_dir)?;
+        let path = entry.build_epub(&output_dir)?;
+        println!("{}", path.display());
     }
     Ok(())
 }
