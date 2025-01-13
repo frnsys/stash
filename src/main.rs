@@ -5,7 +5,7 @@ use std::{
 };
 
 use bpaf::Bpaf;
-use color_eyre::eyre::{Result, bail, eyre};
+use color_eyre::eyre::{bail, eyre, Result};
 use dom_smoothie::{Article as ExtractArticle, Config as ExtractConfig, Readability};
 use epub_builder::{EpubBuilder, EpubContent, ZipLibrary};
 use scraper::{Html, Selector};
@@ -255,7 +255,7 @@ fn main() -> Result<()> {
     println!("Published: {}", entry.published_at);
     println!("Content: {}", entry.content);
     if ask_confirm("Ok?") {
-        let output_dir = expanduser::expanduser(config.output_dir)?;
+        let output_dir: PathBuf = shellexpand::tilde(&config.output_dir).to_string().into();
         let path = entry.build_epub(&output_dir)?;
         println!("{}", path.display());
     }
